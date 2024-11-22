@@ -3,7 +3,37 @@ const { setToken } = require('../utils/verifyToken');
 const Facility = db.facilities;
 const Job = db.jobs;
 const mailTrans = require("../controllers/mailTrans.controller.js");
+const moment = require('moment-timezone');
+var dotenv = require('dotenv');
+dotenv.config()
+
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { v4: uuidv4 } = require('uuid');
+
+const s3 = new S3Client({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  }
+});
+
 const expirationTime = 10000000;
+
+async function uploadToS3(file) {
+    const { content, name, type } = file;
+  
+    const params = {
+        Bucket: process.env.AWS_BUCKET_NAME,
+        Key: `${uuidv4()}_${name}`,
+        Body: Buffer.from(content, 'base64'),
+        ContentType: type
+    };
+  
+    const command = new PutObjectCommand(params);
+    const upload = await s3.send(command);
+    return `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${params.Key}`;
+}
 
 exports.signup = async (req, res) => {
     try {
@@ -25,8 +55,8 @@ exports.signup = async (req, res) => {
             response.contactEmail = response.contactEmail.toLowerCase();
 
             if (response.avatar.name != "") {
-                const content = Buffer.from(response.avatar.content, 'base64');
-                response.avatar.content = content;
+                const s3FileUrl = await uploadToS3(value);
+                response.avatar.content = s3FileUrl;
             }
 
             const auth = new Facility(response);
@@ -39,7 +69,7 @@ exports.signup = async (req, res) => {
                 <strong>Note: The facility will not be able to view shifts until approved by the "Administrator"<br></strong>
                 </p>
                 <p><strong>-----------------------<br></strong></p>
-                <p><strong>Date</strong>: ${moment(Date.now()).format("MM/DD/YYYY")}</p>
+                <p><strong>Date</strong>: ${moment.tz(new Date(), "America/Toronto").format("MM/DD/YYYY")}</p>
                 <p><strong>Name</strong>: ${response.firstName} ${response.lastName}</p>
                 <p><strong>Email / Login</strong><strong>:</strong> <a href="mailto:${response.contactEmail}" target="_blank">${response.contactEmail}</a></p>
                 <p><strong>Phone</strong>: <a href="tel:${response.contactPhone || ''}" target="_blank">${response.contactPhone || ''}</a></p>
@@ -165,24 +195,25 @@ exports.forgotPassword = async (req, res) => {
 exports.verifyCode = async (req, res) => {
     try {
         console.log("verfyCode");
-        const { verifyCode } = req.body;
+        const { verifyCode, email } = req.body;
         console.log(verifyCode);
-        const isUser = await Facility.findOne({ verifyCode: verifyCode });
+        const isUser = await Facility.findOne({ contactEmail: email });
         if (isUser) {
             const verifyTime = Math.floor(Date.now() / 1000);
             if (verifyTime > isUser.verifyTime) {
-                res.status(401).json({message: "This verifyCode is expired. Please regenerate code!"})
+                return res.status(401).json({message: "This verifyCode is expired. Please regenerate code!"});
+            } else {
+                if (isUser.verifyCode == verifyCode) {
+                    return res.status(200).json({message: "Success to verify code."});
+                } else {
+                    return res.status(402).json({message: "Invalid verification code."});
+                }
             }
-            else {
-                res.status(200).json({message: "Success to verify code."})
-            }
-        }
-        else {
-            res.status(404).json({ message: "User Not Found! Please Register First." })
+        } else {
+            return res.status(404).json({ message: "User Not Found! Please Register First." });
         }
     } catch (e) {
-        console.log(e);
-        return res.status(500).json({ message: "An Error Occured!" })
+        return res.status(500).json({ message: "An Error Occured!" });
     }
 }
 
@@ -207,36 +238,37 @@ exports.resetPassword = async (req, res) => {
     }
 }
 
-function extractNonJobId(job) {
-    const keys = Object.keys(job);
-    console.log(keys);
-    
-    // Filter out the key 'email'
-    const nonJobIdKeys = keys.filter(key => key !== 'contactEmail');
-    
-    // Create a new object with the non-email properties
+async function extractNonJobId(job) {
     const newObject = {};
-    nonJobIdKeys.forEach(key => {
+    for (const [key, value] of Object.entries(job)) {
+        if (key === 'contactEmail') continue;
+
         if (key == 'avatar') {
-            let file = job[key];
-            if (file.content) {
-                file.content = Buffer.from(file.content, 'base64');
-            } 
-            newObject[key] = file;
+            if (value.content) {
+                const s3FileUrl = await uploadToS3(value);
+                newObject[key] = {
+                    name: value.name,
+                    type: value.type,
+                    content: s3FileUrl
+                };
+            } else if (!value.name) {
+                newObject[key] = { content: '', type: '', name: '' };
+            }
         } else {
-            newObject[key] = job[key];
+            newObject[key] = value;
         }
-    });
-    
+    }
+    console.log(newObject);
     return newObject;
 }
+
 //Update Account
 exports.Update = async (req, res) => {
     console.log('updateSignal');
     const request = req.body;
     const user = req.user;
     const role = request.userRole || user.userRole;
-    const extracted = extractNonJobId(request);
+    const extracted = await extractNonJobId(request);
 
     if (extracted.updateEmail) {
        extracted.contactEmail =extracted.updateEmail; // Create the new property
@@ -245,7 +277,16 @@ exports.Update = async (req, res) => {
     
     if (user) {
         try {
-            const updatedDocument = await Facility.findOneAndUpdate(role=="Admin" ? { contactEmail: request.contactEmail, userRole: 'Facilities' } : {contactEmail: req.user.contactEmail, userRole: req.user.userRole}, role=="Admin" ? { $set: extracted } : { $set: request }, { new: false });
+            const query = role === "Admin" 
+                            ? { contactEmail: request.contactEmail, userRole: 'Facilities' } 
+                            : { contactEmail: req.user.contactEmail, userRole: req.user.userRole };
+        
+            // Set the fields to update
+            const updateFields = { $set: extracted };
+
+            // Find and update the document
+            const updatedDocument = await Facility.findOneAndUpdate(query, updateFields, { new: true, projection: { signature: 0 } }); // Set `new: true` to return updated document
+        
             const payload = {
                 contactEmail: user.contactEmail,
                 userRole: user.userRole,
@@ -255,8 +296,8 @@ exports.Update = async (req, res) => {
 
             if (role != 'Admin') {
                 const token = setToken(payload);
-                const users = await Facility.findOne({contactEmail: user.contactEmail});
-
+                const users = await Facility.findOne({contactEmail: user.contactEmail}, { signature: 0 });
+                console.log(updatedDocument);
                 return res.status(200).json({ message: 'Trading Signals saved Successfully', token: token, user: users });
             } else {
                 if (updatedDocument) {
@@ -266,8 +307,7 @@ exports.Update = async (req, res) => {
                         const verifiedContent = `
                         <div id=":15j" class="a3s aiL ">
                             <p>Hello ${updatedDocument.firstName},</p>
-                            <p>Your BookSmart™ account has been approved. To login please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw1QDW3VkX4lblO8gh8nfIYo">https://app.whybookdumb.com/<wbr>bs/#home-login</a></p>
-                            <p>To manage your account settings, please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login/knack-account" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login/knack-account&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw3TA8pRD_CD--MZ-ls68oIo">https://app.whybookdumb.com/<wbr>bs/#home-login/knack-account</a></p>
+                            <p>Your BookSmart™ account has been approved.</p>
                         </div>`
                         let approveResult = mailTrans.sendMail(updatedDocument.contactEmail, verifySubject, verifiedContent);
                     } else if (extracted.userStatus == "inactivate") {

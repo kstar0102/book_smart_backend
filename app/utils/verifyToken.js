@@ -37,8 +37,10 @@ const setToken = (tokendata) => {
 }
 
 const verifyUser = (req, res, next) => {
-    // console.log('verifyToken')
+    console.log('verifyToken');
+    console.log(req.user);
     verifyToken(req, res, async () => {
+        console.log(req.user.userRole)
         let isUser = {};
         if (req.user.userRole === "Facilities") {
             isUser = await Facility.findOne({contactEmail: req.user.contactEmail, userRole: req.user.userRole}, { aic: 1, userStatus: 1, userRole: 1, entryDate: 1, companyName: 1, firstName: 1, lastName: 1, contactEmail: 1, contactPhone: 1 })
@@ -48,20 +50,13 @@ const verifyUser = (req, res, next) => {
             isUser = await Admin.findOne({email: req.user.email, userRole: req.user.userRole}, { email: 1, userRole: 1, userStatus: 1, firstName: 1, lastName: 1 });
         }
         
-        console.log(req.user);
+        console.log(isUser);
         if (isUser) {
-            const currentDate = Math.floor(Date.now() / 1000);
-            console.log(currentDate);
-            if (currentDate < req.user.exp){
-                req.user = isUser;
-                next();
-            } else {
-                res.status(401).json({success: false, message: "Token is expired"})
-            }
+            req.user = isUser;
+            next();
         }
         else res.status(401).json({success: false, message: "You are not authenticated!"})
     });
-
 };
 
 const verifyAdmin = (req, res, next) => {

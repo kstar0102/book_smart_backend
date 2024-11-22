@@ -61,7 +61,7 @@ module.exports = mongoose => {
             zip: { type: String, default: '' },
         },
         avatar: {
-            content: { type: Buffer, default: '' },
+            content: { type: String, default: '' },
             type: { type: String, default: '' },
             name: { type: String, default: '' }
         },
@@ -84,6 +84,8 @@ module.exports = mongoose => {
         object.id = _id;
         return object;
     });
+
+    schema.index({ contactEmail: 1 }); // added indexing
 
     const Facility = mongoose.model("Facility", schema);
     return Facility;

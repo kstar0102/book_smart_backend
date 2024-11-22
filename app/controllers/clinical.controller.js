@@ -4,11 +4,40 @@ const Clinical = db.clinical;
 const Bid = db.bids;
 const Job = db.jobs;
 const mailTrans = require("../controllers/mailTrans.controller.js");
-const moment = require('moment');
+const moment = require('moment-timezone');
 const phoneSms = require('../controllers/twilio.js');
-const { resume } = require("pdfkit");
+var dotenv = require('dotenv');
+dotenv.config()
+
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { v4: uuidv4 } = require('uuid');
+
+const s3 = new S3Client({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  }
+});
 
 const expirationTime = 10000000;
+
+async function uploadToS3(file) {
+    const { content, name, type } = file;
+  
+    const params = {
+        Bucket: process.env.AWS_BUCKET_NAME,
+        Key: `${uuidv4()}_${name}`,
+        Body: Buffer.from(content, 'base64'),
+        ContentType: type
+    };
+  
+    const command = new PutObjectCommand(params);
+    const upload = await s3.send(command);
+    console.log(`https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${params.Key}`);
+    return `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${params.Key}`;
+}
+
 //Regiseter Account
 exports.signup = async (req, res) => {
     try {
@@ -26,7 +55,7 @@ exports.signup = async (req, res) => {
                 <strong>Note: Once you are "APPROVED" you will be notified via email and can view shifts<br></strong>
                 </p>
                 <p><strong>-----------------------<br></strong></p>
-                <p><strong>Date</strong>: ${moment(Date.now()).format("MM/DD/YYYY")}</p>
+                <p><strong>Date</strong>: ${moment.tz(new Date(), "America/Toronto").format("MM/DD/YYYY")}</p>
                 <p><strong>Nurse-ID</strong>: ${newClinicianId}</p>
                 <p><strong>Name</strong>: ${response.firstName} ${response.lastName}</p>
                 <p><strong>Email / Login</strong><strong>:</strong> <a href="mailto:${response.email}" target="_blank">${response.email}</a></p>
@@ -41,8 +70,8 @@ exports.signup = async (req, res) => {
             response.clinicalAcknowledgeTerm = false;
 
             if (response.photoImage.name != "") {
-                const content = Buffer.from(response.photoImage.content, 'base64');
-                response.photoImage.content = content;
+                const s3FileUrl = await uploadToS3(response.photoImage);
+                response.photoImage.content = s3FileUrl;
             }
             
             const auth = new Clinical(response);
@@ -60,7 +89,7 @@ exports.signup = async (req, res) => {
                 <strong>Note: The caregivers will not be able to view shifts until approved by the "Administrator"<br></strong>
                 </p>
                 <p><strong>-----------------------<br></strong></p>
-                <p><strong>Date</strong>: ${moment(Date.now()).format("MM/DD/YYYY")}</p>
+                <p><strong>Date</strong>: ${moment.tz(new Date(), "America/Toronto").format("MM/DD/YYYY")}</p>
                 <p><strong>Nurse-ID</strong>: ${newClinicianId}</p>
                 <p><strong>Name</strong>: ${response.firstName} ${response.lastName}</p>
                 <p><strong>Email / Login</strong><strong>:</strong> <a href="mailto:${response.email}" target="_blank">${response.email}</a></p>
@@ -158,17 +187,18 @@ exports.login = async (req, res) => {
     }
 }
 
-function extractNonJobId(job) {
+async function extractNonJobId(job) {
     const newObject = {};
     for (const [key, value] of Object.entries(job)) {
         if (key === 'email') continue;
 
         if (key == 'photoImage' || key == 'driverLicense' || key == 'socialCard' || key == 'physicalExam' || key == 'ppd' || key == 'mmr' || key == 'healthcareLicense' || key == 'resume' || key == 'covidCard' || key == 'bls' || key == 'hepB' || key == 'flu' || key == 'cna' || key == 'taxForm' || key == 'chrc102' || key == 'chrc103' || key == 'drug' || key == 'ssc' || key == 'copyOfTB') {
             if (value.content) {
+                const s3FileUrl = await uploadToS3(value);
                 newObject[key] = {
                     name: value.name,
                     type: value.type,
-                    content: Buffer.from(value.content, 'base64')
+                    content: s3FileUrl
                 };
             } else if (!value.name) {
                 newObject[key] = { content: '', type: '', name: '' };
@@ -233,15 +263,19 @@ exports.forgotPassword = async (req, res) => {
 exports.verifyCode = async (req, res) => {
     try {
         console.log("verfyCode");
-        const { verifyCode } = req.body;
+        const { verifyCode, email } = req.body;
         console.log(verifyCode);
-        const isUser = await Clinical.findOne({ verifyCode: verifyCode }, { verifyTime: 1 });
+        const isUser = await Clinical.findOne({ email: email }, { verifyTime: 1, verifyCode: 1 });
         if (isUser) {
             const verifyTime = Math.floor(Date.now() / 1000);
             if (verifyTime > isUser.verifyTime) {
                 return res.status(401).json({message: "This verifyCode is expired. Please regenerate code!"})
             } else {
-                return res.status(200).json({message: "Success to verify code."})
+                if (isUser.verifyCode == verifyCode) {
+                    return res.status(200).json({message: "Success to verify code."});
+                } else {
+                    return res.status(401).json({message: "Invalid verification code."});
+                }
             }
         } else {
             res.status(404).json({ message: "User Not Found! Please Register First." })
@@ -360,8 +394,7 @@ exports.updateUserStatus = async (req, res) => {
                 const verifiedContent2 = `
                 <div id=":15j" class="a3s aiL ">
                     <p>Hello ${isUser.firstName},</p>
-                    <p>Your BookSmart™ account has been approved. To login please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw1QDW3VkX4lblO8gh8nfIYo">https://app.whybookdumb.com/<wbr>bs/#home-login</a></p>
-                    <p>To manage your account settings, please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login/knack-account" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login/knack-account&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw3TA8pRD_CD--MZ-ls68oIo">https://app.whybookdumb.com/<wbr>bs/#home-login/knack-account</a></p>
+                    <p>Your BookSmart™ account has been approved.</p>
                 </div>`
                 let approveResult2 = mailTrans.sendMail(isUser.email, verifySubject2, verifiedContent2);
             } else {
@@ -390,25 +423,24 @@ exports.Update = async (req, res) => {
     const role = req.headers.userrole || user.userRole;
     console.log(user);
 
-    const extracted = extractNonJobId(request);
+    const extracted = await extractNonJobId(request);
 
     if (extracted.updateEmail) {
        extracted.email = extracted.updateEmail;
        delete extracted.updateEmail;
     }
 
-    const existUser = await Clinical.findOne(role == "Admin" ? { email: request.email } : { email: user.email });
-
-    if (!existUser) {
-        return res.status(404).json({ error: "User not found" });
-    }
-
     if (user) {
-        Clinical.findOneAndUpdate(role == "Admin" ? { email: request.email } : { email: user.email }, { $set: extracted }, { new: false }, (err, updatedDocument) => {
+console.log('updating....');
+console.log(extracted);
+console.log(request.email, user.email);
+        Clinical.findOneAndUpdate(role == "Admin" ? { email: request.email } : { email: user.email }, { $set: extracted }, { new: true }, (err, updatedDocument) => {
+            console.log('updated');
             if (err) {
                 console.log(err);
                 return res.status(500).json({ error: err });
             } else {
+                console.log('sending mail');
                 let updatedData = updatedDocument;
 
                 if (role == "Admin" && extracted.userStatus == "activate" && extracted.userStatus != existUser.userStatus) {
@@ -417,8 +449,7 @@ exports.Update = async (req, res) => {
                     const verifiedContent = `
                     <div id=":15j" class="a3s aiL ">
                         <p>Hello ${updatedData.firstName},</p>
-                        <p>Your BookSmart™ account has been approved. To login please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw1QDW3VkX4lblO8gh8nfIYo">https://app.whybookdumb.com/<wbr>bs/#home-login</a></p>
-                        <p>To manage your account settings, please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login/knack-account" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login/knack-account&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw3TA8pRD_CD--MZ-ls68oIo">https://app.whybookdumb.com/<wbr>bs/#home-login/knack-account</a></p>
+                        <p>Your BookSmart™ account has been approved.</p>
                     </div>`
                     let approveResult = mailTrans.sendMail(updatedData.email, verifySubject, verifiedContent);
                 }
@@ -438,15 +469,12 @@ exports.Update = async (req, res) => {
                     iat: Math.floor(Date.now() / 1000), // Issued at time
                     exp: Math.floor(Date.now() / 1000) + expirationTime // Expiration time
                 }
+                console.log('end');
                 const token = setToken(payload);
-                if (role != 'Clinician') {
-                    if (updatedData) {
-                        res.status(200).json({ message: 'Responded Successfully!', token: token, user: updatedData });
-                    }
+                if (updatedData) {
+                    return res.status(200).json({ message: 'Responded Successfully!', token: token, user: updatedData });
                 } else {
-                    if (updatedData) {
-                        res.status(200).json({ message: 'Responded Successfully!', token: token, user: [] });
-                    }
+                    return res.status(200).json({ message: 'Responded Successfully!', token: token, user: [] });
                 }
             }
         })
@@ -457,9 +485,8 @@ exports.getUserImage = async (req, res) => {
     try {
         const { userId, filename } = req.body;
         const isUser = await Clinical.findOne({ aic: userId }, { [filename]: 1 });
-        const content = isUser[filename]?.content.toString('base64');
 
-        return res.status(200).json({ message: "Successfully Get!", data: { name: isUser[filename].name, type: isUser[filename].type, content: content } });
+        return res.status(200).json({ message: "Successfully Get!", data: isUser[filename] });
     } catch (e) {
         console.log(e);
         return res.status(500).json({ message: "An Error Occured!" })
@@ -790,80 +817,10 @@ exports.allCaregivers = async (req, res) => {
         const user = req.user;
         const { search = '', page = 1, filters = [] } = req.body;
         const limit = 5;
-        const skip = (page - 1) * limit;
+        let perPage = page;
         const query = {};
 
-        // filters.forEach(filter => {
-        //     const { logic = 'and', field, condition, value } = filter;
-        
-        //     let fieldNames = [];
-        
-        //     // For Name, use both firstName and lastName in an OR condition
-        //     if (field === 'Name') {
-        //         fieldNames = ['firstName', 'lastName']; 
-        //     } else if (field === 'Email') {
-        //         fieldNames = ['email']; 
-        //     } else if (field === 'User Roles') {
-        //         fieldNames = ['userRole'];
-        //     } else if (field === 'User Status') {
-        //         fieldNames = ['userStatus'];
-        //     }
-        
-        //     const conditions = [];
-        
-        //     fieldNames.forEach(fieldName => {
-        //         let conditionObj = {};
-        //         switch (condition) {
-        //             case 'is':
-        //                 conditionObj[fieldName] = value;
-        //                 break;
-        //             case 'is not':
-        //                 conditionObj[fieldName] = { $ne: value };
-        //                 break;
-        //             case 'contains':
-        //                 conditionObj[fieldName] = { $regex: value, $options: 'i' };
-        //                 break;
-        //             case 'does not contain':
-        //                 conditionObj[fieldName] = { $not: { $regex: value, $options: 'i' } };
-        //                 break;
-        //             case 'starts with':
-        //                 conditionObj[fieldName] = { $regex: '^' + value, $options: 'i' };
-        //                 break;
-        //             case 'ends with':
-        //                 conditionObj[fieldName] = { $regex: value + '$', $options: 'i' };
-        //                 break;
-        //             case 'is blank':
-        //                 conditionObj[fieldName] = { $exists: false };
-        //                 break;
-        //             case 'is not blank':
-        //                 conditionObj[fieldName] = { $exists: true, $ne: null };
-        //                 break;
-        //             case 'higher than':
-        //                 conditionObj[fieldName] = { $gt: value };
-        //                 break;
-        //             case 'lower than':
-        //                 conditionObj[fieldName] = { $lt: value };
-        //                 break;
-        //             default:
-        //                 break;
-        //         }
-        //         conditions.push(conditionObj); // Collect conditions for the field
-        //     });
-        
-        //     // If the field is Name, apply OR logic between firstName and lastName
-        //     if (field === 'Name') {
-        //         query.$or = query.$or ? [...query.$or, ...conditions] : conditions;
-        //     } else {
-        //         // Apply AND or OR logic for other fields based on the `logic` parameter
-        //         if (logic === 'or') {
-        //             query.$or = query.$or ? [...query.$or, ...conditions] : conditions;
-        //         } else {
-        //             query.$and = query.$and ? [...query.$and, ...conditions] : conditions;
-        //         }
-        //     }
-        // });
-
-        if (search) {
+        if (search.trim()) {
             query.$or = [
                 { firstName: { $regex: search, $options: 'i' } },
                 { lastName: { $regex: search, $options: 'i' } },
@@ -872,17 +829,25 @@ exports.allCaregivers = async (req, res) => {
                 { entryDate: { $regex: search, $options: 'i' } },
                 { email: { $regex: search, $options: 'i' } }
             ];
+            perPage = 1;
         }
 
-        const data = await Clinical.find(query, { firstName: 1, lastName: 1, aic: 1, entryDate: 1, phoneNumber: 1, title: 1, email: 1, userStatus: 1 })
+        const skip = (perPage - 1) * limit;
+
+        console.log("Search Query:", search, "Page:", perPage, "Skip: ", skip, "Query Object:", JSON.stringify(query));
+
+        // Fetching data with pagination and allowing disk use for sorting
+        const data = await Clinical.find(query, { 
+                firstName: 1, lastName: 1, aic: 1, entryDate: 1, phoneNumber: 1, title: 1, email: 1, userStatus: 1 
+            })
+            .sort({ aic: -1 })
             .skip(skip)
             .limit(limit)
             .lean();
-  
-        // Count total number of documents matching the query
+
         const totalRecords = await Clinical.countDocuments(query);
         const totalPageCnt = Math.ceil(totalRecords / limit);
-      
+
         let dataArray = [];
 
         for (const item of data) {
@@ -905,13 +870,13 @@ exports.allCaregivers = async (req, res) => {
                 'view_shift',
                 'verification',
                 item.userStatus,
-                awarded == 0 ? '' : awarded,
-                applied == 0 ? '' : applied,
+                awarded === 0 ? '' : awarded,
+                applied === 0 ? '' : applied,
                 ratio,
                 'pw',
                 item.aic,
             ]);
-        };
+        }
 
         const payload = {
             email: user.email,
@@ -924,11 +889,11 @@ exports.allCaregivers = async (req, res) => {
         if (token) {
             res.status(200).json({ message: "Successfully Get!", dataArray, totalPageCnt, token });
         } else {
-            res.status(400).json({ message: "Cannot logined User!" });
+            res.status(400).json({ message: "Cannot log in User!" });
         }
     } catch (e) {
-        console.log(e);
-        return res.status(500).json({ message: "An Error Occured!" })
+        console.error(e);
+        return res.status(500).json({ message: "An Error Occurred!" });
     }
 };
 

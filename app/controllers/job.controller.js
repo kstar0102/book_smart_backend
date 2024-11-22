@@ -4,7 +4,7 @@ const Job = db.jobs;
 const Bid = db.bids;
 const Facility = db.facilities;
 const Clinical = db.clinical;
-const moment = require('moment');
+const moment = require('moment-timezone');
 const nodemailer = require('nodemailer');
 const mailTrans = require("../controllers/mailTrans.controller.js");
 const invoiceHTML = require('../utils/invoiceHtml.js');
@@ -12,6 +12,19 @@ const { generatePDF } = require('../utils/pdf');
 const path = require('path');
 const cron = require('node-cron');
 const phoneSms = require('../controllers/twilio.js');
+var dotenv = require('dotenv');
+dotenv.config()
+
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { v4: uuidv4 } = require('uuid');
+
+const s3 = new S3Client({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  }
+});
 
 // const limitAccNum = 100;
 const expirationTime = 10000000;
@@ -60,16 +73,24 @@ function parseTime(timeStr) {
   return new Date(0, 0, 0, hours, minutes || 0); // Create a date object for time
 }
 
+async function uploadToS3(file) {
+  const { content, name, type } = file;
+
+  const params = {
+    Bucket: process.env.AWS_BUCKET_NAME,
+    Key: `${uuidv4()}_${name}`,
+    Body: Buffer.from(content, 'base64'),
+    ContentType: type
+  };
+
+  const command = new PutObjectCommand(params);
+  const upload = await s3.send(command);
+  return `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${params.Key}`;
+}
+
 exports.updateTimeSheet = async (req, res) => {
   const user = req.user;
   const request = req.body;
-  let timeSheetFile = request.timeSheet;
-  const content = Buffer.from(timeSheetFile.content, 'base64');
-  const jobDetail = await Job.findOne({ jobId: request.jobId }, { facilityId: 1 });
-  const facility = await Facility.findOne({ aic: jobDetail.facilityId }, { contactEmail: 1 });
-
-  await Job.updateOne({ jobId: request.jobId }, { $set: {timeSheet: { content: content, name: timeSheetFile.name, type: timeSheetFile.type }, jobStatus: 'Pending Verification'} });
-
   const payload = {
     email: user.email,
     userRole: user.userRole,
@@ -78,20 +99,33 @@ exports.updateTimeSheet = async (req, res) => {
   };
   const token = setToken(payload);
 
-  const verifySubject1 = `${user.firstName} ${user.lastName} has uploaded a timesheet for Shift ID # ${request.jobId}`
-  const verifiedContent1 = `
-  <div id=":15j" class="a3s aiL ">
-    <p><strong>Shift ID</strong> : ${request.jobId}</p>
-    <p><strong>Name</strong> : ${user.firstName} ${user.lastName}</p>
-    <p><strong>Timesheet</strong> : ${timeSheetFile?.name || ''}</p>
-  </div>`
+  let timeSheetFile = request.timeSheet;
+  if (timeSheetFile == "" || !timeSheetFile) {
+    await Job.updateOne({ jobId: request.jobId }, { $set: {timeSheet: { content: '', name: '', type: '' }, jobStatus: 'Pending'} });
+    return res.status(200).json({ message: 'The timesheet has been updated.', token: token });
+  } else {
+    const jobDetail = await Job.findOne({ jobId: request.jobId }, { facilityId: 1 });
+    const facility = await Facility.findOne({ aic: jobDetail.facilityId }, { contactEmail: 1 });
 
-  let approveResult1 = await mailTrans.sendMail('support@whybookdumb.com', verifySubject1, verifiedContent1, request.timeSheet);
-  let approveResult2 = await mailTrans.sendMail('getpaid@whybookdumb.com', verifySubject1, verifiedContent1, request.timeSheet);
-  let approveResult3 = await mailTrans.sendMail('techableteam@gmail.com', verifySubject1, verifiedContent1, request.timeSheet);
-  let approveResult4 = await mailTrans.sendMail(facility?.contactEmail, verifySubject1, verifiedContent1, request.timeSheet);
+    const s3FileUrl = await uploadToS3(timeSheetFile);
 
-  return res.status(200).json({ message: 'The timesheet has been updated.', token: token });
+    await Job.updateOne({ jobId: request.jobId }, { $set: {timeSheet: { content: s3FileUrl, name: timeSheetFile.name, type: timeSheetFile.type }, jobStatus: 'Pending Verification'} });
+
+    const verifySubject1 = `${user.firstName} ${user.lastName} has uploaded a timesheet for Shift ID # ${request.jobId}`
+    const verifiedContent1 = `
+    <div id=":15j" class="a3s aiL ">
+      <p><strong>Shift ID</strong> : ${request.jobId}</p>
+      <p><strong>Name</strong> : ${user.firstName} ${user.lastName}</p>
+      <p><strong>Timesheet</strong> : ${timeSheetFile?.name || ''}</p>
+    </div>`
+
+    let approveResult1 = await mailTrans.sendMail('support@whybookdumb.com', verifySubject1, verifiedContent1, request.timeSheet);
+    let approveResult2 = await mailTrans.sendMail('getpaid@whybookdumb.com', verifySubject1, verifiedContent1, request.timeSheet);
+    let approveResult3 = await mailTrans.sendMail('techableteam@gmail.com', verifySubject1, verifiedContent1, request.timeSheet);
+    let approveResult4 = await mailTrans.sendMail(facility?.contactEmail, verifySubject1, verifiedContent1, request.timeSheet);
+
+    return res.status(200).json({ message: 'The timesheet has been updated.', token: token });
+  }
 };
 
 exports.updateDocuments = async (req, res) => {
@@ -109,7 +143,8 @@ exports.updateDocuments = async (req, res) => {
 
     if (type == 'timesheet') {
       if (file.name != '') {
-        await Job.updateOne({ jobId }, { $set: {timeSheet: file, jobStatus: 'Pending Verification'} });
+        const s3FileUrl = await uploadToS3(timeSheetFile);
+        await Job.updateOne({ jobId }, { $set: {timeSheet: { content: s3FileUrl, type: file.type, name: file.name }, jobStatus: 'Pending Verification'} });
       } else {
         if (prevFile == '') {
           await Job.updateOne({ jobId }, { $set: {timeSheet: { content: '', type: '', name: '' }, jobStatus: 'Available'} });
@@ -118,7 +153,8 @@ exports.updateDocuments = async (req, res) => {
       return res.status(200).json({ message: 'The timesheet has been updated.', token: token });
     } else {
       if (file.name != '') {
-        await Job.updateOne({ jobId }, { $set: {timeSheetTemplate: file, jobStatus: 'Pending Verification'} });
+        const s3FileUrl = await uploadToS3(timeSheetFile);
+        await Job.updateOne({ jobId }, { $set: {timeSheetTemplate: { content: s3FileUrl, type: file.type, name: file.name }, jobStatus: 'Pending Verification'} });
       } else {
         if (prevFile == '') {
           await Job.updateOne({ jobId }, { $set: {timeSheetTemplate: { content: '', type: '', name: '' }, jobStatus: 'Available'} });
@@ -140,7 +176,7 @@ exports.postJob = async (req, res) => {
       const lastJobId = lastJob.length > 0 ? lastJob[0].jobId : 0; // Get the last jobId value or default to 0
       const newJobId = lastJobId + 1; // Increment the last jobId by 1 to set the new jobId for the next data entry
       const response = req.body;
-      response.entryDate = moment(new Date()).format("MM/DD/YYYY");
+      response.entryDate = moment.tz(new Date(), "America/Toronto").format("MM/DD/YYYY");
       response.payRate = response.payRate;
       response.jobId = newJobId;
       const auth = new Job(response);
@@ -185,6 +221,7 @@ exports.removeJob = async (req, res) => {
 //Login Account
 exports.shifts = async (req, res) => {
   try {
+    console.log("start =============");
     const user = req.user;
     const role = req.headers.role;
     console.log(user, role);
@@ -231,7 +268,7 @@ exports.shifts = async (req, res) => {
       }
     } else if (role === "Clinician") {
       console.log('started');
-      const today = moment(new Date()).format("MM/DD/YYYY");
+      const today = moment.tz(new Date(), "America/Toronto").format("MM/DD/YYYY");
       console.log(today);
       const data = await Job.find({ 
         entryDate: { 
@@ -240,7 +277,7 @@ exports.shifts = async (req, res) => {
       }, { jobId: 1, degree: 1, shiftDate: 1, shiftTime: 1, location: 1, jobStatus: 1, jobNum: 1, payRate: 1, jobInfo: 1, bonus: 1 }).sort({ entryDate: 1 });
       let dataArray = [];
       data.map((item, index) => {
-        console.log(user.title);
+        console.log(user.title, item.degree);
         if (item.jobStatus == 'Available' && item.degree == user.title) {
           dataArray.push({
             jobId: item.jobId,
@@ -271,95 +308,13 @@ exports.shifts = async (req, res) => {
         res.status(400).json({ message: "Cannot logined User!" })
       }
     } else if (role === 'Admin') {
-      const { search = '', page = 1, filters = [] } = req.body;
+      const { search = '', page = 1 } = req.body;
       const limit = 5;
       const skip = (page - 1) * limit;
       const query = {};
-      console.log(search, page, filters);
+      console.log(search, page);
 
-      // filters.forEach(filter => {
-      //   const { logic = 'and', field, condition, value } = filter;
-    
-      //   let fieldNames = [];
-    
-      //   if (field === 'Job Status') {
-      //     fieldNames = ['jobStatus']; 
-      //   } else if (field === 'Facility') {
-      //     fieldNames = ['facility']; 
-      //   } else if (field === 'Job-ID') {
-      //     fieldNames = ['jobId'];
-      //   } else if (field === 'Job Bum #') {
-      //     fieldNames = ['jobNum'];
-      //   } else if (field === 'Location') {
-      //     fieldNames = ['location'];
-      //   } else if (field === 'Count - BDA') {
-      //     fieldNames = ['countBDA'];
-      //   } else if (field === 'Nurse') {
-      //     fieldNames = ['nurse'];
-      //   } else if (field === 'Degree/Discipline') {
-      //     fieldNames = ['degree'];
-      //   } else if (field === 'Bids / Offers') {
-      //     fieldNames = ['bid_offer'];
-      //   } else if (field === 'Hours Submitted?') {
-      //     fieldNames = ['isHoursSubmit'];
-      //   } else if (field === 'Hours Approved?') {
-      //     fieldNames = ['isHoursApproved'];
-      //   } else if (field === 'Timesheet Template') {
-      //     fieldNames = ['timeSheetTemplate'];
-      //   } else if (field === 'Timesheet Upload') {
-      //     fieldNames = ['timeSheet'];
-      //   } else if (field === 'No Status Explanation') {
-      //     fieldNames = ['noStatusExplanation'];
-      //   }
-    
-      //   const conditions = [];
-    
-      //   fieldNames.forEach(fieldName => {
-      //     let conditionObj = {};
-      //     switch (condition) {
-      //       case 'is':
-      //         conditionObj[fieldName] = value;
-      //         break;
-      //       case 'is not':
-      //         conditionObj[fieldName] = { $ne: value };
-      //         break;
-      //       case 'contains':
-      //         conditionObj[fieldName] = { $regex: value, $options: 'i' };
-      //         break;
-      //       case 'does not contain':
-      //         conditionObj[fieldName] = { $not: { $regex: value, $options: 'i' } };
-      //         break;
-      //       case 'starts with':
-      //         conditionObj[fieldName] = { $regex: '^' + value, $options: 'i' };
-      //         break;
-      //       case 'ends with':
-      //         conditionObj[fieldName] = { $regex: value + '$', $options: 'i' };
-      //         break;
-      //       case 'is blank':
-      //         conditionObj[fieldName] = { $exists: false };
-      //         break;
-      //       case 'is not blank':
-      //         conditionObj[fieldName] = { $exists: true, $ne: null };
-      //         break;
-      //       default:
-      //         break;
-      //     }
-      //     conditions.push(conditionObj);
-      //   });
-    
-      //   if (field === 'Name') {
-      //     query.$or = query.$or ? [...query.$or, ...conditions] : conditions;
-      //   } else {
-      //     if (logic === 'or') {
-      //       query.$or = query.$or ? [...query.$or, ...conditions] : conditions;
-      //     } else {
-      //       query.$and = query.$and ? [...query.$and, ...conditions] : conditions;
-      //     }
-      //   } 
-      // });
-
-
-      if (search) {
+      if (search.trim()) {
         const isNumeric = !isNaN(search);
         query.$or = [
           { entryDate: { $regex: search, $options: 'i' } },
@@ -371,20 +326,39 @@ exports.shifts = async (req, res) => {
           { noStatusExplanation: { $regex: search, $options: 'i' } }
         ];
       }
-      console.log(query);
 
-      const data = await Job.find(query, { jobId: 1, entryDate: 1, facility: 1, jobNum: 1, location: 1, shiftDate: 1, shiftTime: 1, degree: 1, jobStatus: 1, bid_offer: 1, isHoursApproved: 1, isHoursSubmit: 1, timeSheet: { content: '', name: '$timeSheet.name', type: '$timeSheet.type' }, timeSheetTemplate: { content: '', name: '$timeSheetTemplate.name', type: '$timeSheetTemplate.type' }, noStatusExplanation: 1 })
-                              .skip(skip)
-                              .limit(limit)
-                              .lean();
+      const pipeline = [
+        { $match: query },
+        { $project: {
+            entryDate: 1, facility: 1, jobId: 1, jobNum: 1, location: 1, shiftDate: 1, 
+            shiftTime: 1, degree: 1, jobStatus: 1, isHoursSubmit: 1, isHoursApproved: 1,
+            timeSheet: { content: '', name: '$timeSheet.name', type: '$timeSheet.type' },
+            timeSheetTemplate: { content: '', name: '$timeSheetTemplate.name', type: '$timeSheetTemplate.type' },
+            noStatusExplanation: 1
+        }},
+        { $skip: skip },
+        { $limit: limit }
+      ];
 
+      const data = await Job.aggregate(pipeline);
+      console.log("got data");
       const totalRecords = await Job.countDocuments(query);
       const totalPageCnt = Math.ceil(totalRecords / limit);
-      let dataArray = [];
 
+      const jobIds = data.map(item => item.jobId);
+      const bids = await Bid.find({ jobId: { $in: jobIds } }).lean();
+      const bidMap = {};
+      const totalBidCountMap = {};
+      
+      bids.forEach(bid => {
+        if (bid.bidStatus === 'Awarded') {
+          bidMap[bid.jobId] = bid.caregiver;
+        }
+        totalBidCountMap[bid.jobId] = (totalBidCountMap[bid.jobId] || 0) + 1;
+      });
+
+      let dataArray = [];
       for (const item of data) {
-        const hiredUser = await Bid.findOne({ jobId: item.jobId, bidStatus: 'Awarded' });
-        const totalBidderCnt = await Bid.countDocuments({ jobId: item.jobId });
         dataArray.push([
           item.entryDate,
           item.facility,
@@ -396,8 +370,8 @@ exports.shifts = async (req, res) => {
           "view_shift",
           item.degree,
           item.jobStatus,
-          hiredUser ? hiredUser.caregiver : '',
-          totalBidderCnt,
+          bidMap[item.jobId] || '',
+          totalBidCountMap[item.jobId] || 0,
           "view_hours",
           item.isHoursSubmit ? "yes" : "no",
           item.isHoursApproved ? "yes" : "no",
@@ -407,23 +381,8 @@ exports.shifts = async (req, res) => {
           "delete"
         ])
       }
-      console.log(dataArray);
-
-      const payload = {
-        email: user.email,
-        userRole: user.userRole,
-        iat: Math.floor(Date.now() / 1000), // Issued at time
-        exp: Math.floor(Date.now() / 1000) + expirationTime // Expiration time
-      }
-      const token = setToken(payload);
-      // console.log('token----------------------------------------------------->',token);
-      if (token) {
-        // const updateUser = await Job.updateOne({email: email, userRole: userRole}, {$set: {logined: true}});
-        res.status(200).json({ message: "Successfully Get!", dataArray, totalPageCnt, token });
-      }
-      else {
-        res.status(400).json({ message: "Cannot logined User!" })
-      }
+      console.log(dataArray.length);
+      return res.status(200).json({ message: "Successfully Get!", dataArray, totalPageCnt });
     }
   } catch (e) {
     console.log(e);
@@ -519,7 +478,7 @@ exports.setAwarded = async (req, res) => {
     const verifySubject1 = `Congrats ${nurse?.caregiver}, You Have Been Hired for Shift - #${jobId}`
     const verifiedContent1 = `
     <div id=":15j" class="a3s aiL ">
-      <p><strong>Entry Date</strong> - ${moment(new Date()).format("MM/DD/YYYY")}</p>
+      <p><strong>Entry Date</strong> - ${moment.tz(new Date(), "America/Toronto").format("MM/DD/YYYY")}</p>
       <p><strong>Job</strong> - ${jobId}</p>
       <p><strong>Name</strong> : ${nurse?.caregiver}</p>
     </div>`
@@ -529,7 +488,7 @@ exports.setAwarded = async (req, res) => {
     const verifySubject2 =  `${nurse?.caregiver} was hired for Shift - #${jobId}`
     const verifiedContent2 = `
     <div id=":15j" class="a3s aiL ">
-      <p><strong>Entry Date</strong> - ${moment(new Date()).format("MM/DD/YYYY")}</p>
+      <p><strong>Entry Date</strong> - ${moment.tz(new Date(), "America/Toronto").format("MM/DD/YYYY")}</p>
       <p><strong>Job</strong> - ${jobId}</p>
       <p><strong>Name</strong> : ${nurse?.caregiver}</p>
     </div>`
@@ -563,8 +522,8 @@ exports.updateJobTSVerify = async (req, res) => {
   }
 
   if (file?.content) {
-    const content = Buffer.from(file.content, 'base64');
-    await Job.updateOne({ jobId }, { $set: { timeSheet: { name: file.name, content: content, type: file.type } }});
+    const s3FileUrl = await uploadToS3(file);
+    await Job.updateOne({ jobId }, { $set: { timeSheet: { name: file.name, content: s3FileUrl, type: file.type } }});
   }
 
   if (status == 1) {
@@ -597,6 +556,7 @@ exports.myShift = async (req, res) => {
   try {
     const user = req.user;
     const role = req.headers.role;
+    console.log(user);
 
     const jobIds = await Bid.find({ caregiverId: user?.aic, bidStatus: { $ne: 'Not Awarded' }  }, { jobId: 1 }).lean();
     const jobIdArray = jobIds.map(bid => bid.jobId);
@@ -625,7 +585,7 @@ exports.myShift = async (req, res) => {
           shiftEndTime: item.shiftEndTime
         });
       })
-      const date = moment(new Date()).format("MM/DD/YYYY");
+      const date = moment.tz(new Date(), "America/Toronto").format("MM/DD/YYYY");
       // const date = "04/03/2024"
       const jobs = await Job.find({ jobId: { $in: jobIdArray }, shiftDate: date }, { payRate: 1, shiftStartTime: 1, shiftEndTime: 1, bonus: 1, jobStatus: 1 });
       console.log(jobs);
@@ -650,8 +610,8 @@ exports.myShift = async (req, res) => {
       const weekly = await Job.find({
         email: user.email,
         shiftDate: {
-          $gte: moment(monday).format("MM/DD/YYYY"), // Convert to YYYY-MM-DD
-          $lte: moment(today).format("MM/DD/YYYY"),
+          $gte: moment(monday, "America/Toronto").format("MM/DD/YYYY"), // Convert to YYYY-MM-DD
+          $lte: moment.tz(today, "America/Toronto").format("MM/DD/YYYY"),
         },
       }, { payRate: 1, jobStatus: 1, shiftStartTime: 1, shiftEndTime: 1, bonus: 1 });
 
@@ -681,7 +641,7 @@ exports.myShift = async (req, res) => {
           jobData: {
             reportData: dataArray,
             dailyPay: { pay: totalPay, date: date },
-            weeklyPay: { date: moment(monday).format("MM/DD/YYYY") + "-" + moment(today).format("MM/DD/YYYY"), pay: weeklyPay }
+            weeklyPay: { date: moment(monday, "America/Toronto").format("MM/DD/YYYY") + "-" + moment(today, "America/Toronto").format("MM/DD/YYYY"), pay: weeklyPay }
           },
           token: token
         }
@@ -859,9 +819,8 @@ exports.getCaregiverTimesheets = async (req, res) => {
 exports.getTimesheet = async (req, res) => {
   try {
     let result = await Job.findOne({ jobId: req.body.jobId });
-    const content = result.timeSheet.content.toString('base64');
     
-    return res.status(200).json({ message: "Success", data: { name: result.timeSheet.name, type: result.timeSheet.type, content: content } });
+    return res.status(200).json({ message: "Success", data: result.timeSheet });
   } catch (e) {
     return res.status(500).json({ message: "An Error Occured!" })
   }
@@ -1145,7 +1104,7 @@ exports.Update = async (req, res) => {
                   <strong> ${updatedDocument.nurse}: You failed in job:${updatedDocument.jobId} beacuse the Facility don't accept you.<br></strong>
                   </p>
                   <p><strong>-----------------------<br></strong></p>
-                  <p><strong>Date</strong>: ${moment(Date.now()).format("MM/DD/YYYY")}</p>
+                  <p><strong>Date</strong>: ${moment.tz(new Date(), "America/Toronto").format("MM/DD/YYYY")}</p>
                   <p><strong><span class="il">BookSmart</span>™ <br></strong></p>
                   <p><br></p>
               </div>`
@@ -1156,7 +1115,7 @@ exports.Update = async (req, res) => {
                   <strong> ${updatedDocument.nurse}: You accepted in job:${updatedDocument.jobId}.<br></strong>
                   </p>
                   <p><strong>-----------------------<br></strong></p>
-                  <p><strong>Date</strong>: ${moment(Date.now()).format("MM/DD/YYYY")}</p>
+                  <p><strong>Date</strong>: ${moment.tz(new Date(), "America/Toronto").format("MM/DD/YYYY")}</p>
                   <p><strong><span class="il">BookSmart</span>™ <br></strong></p>
                   <p><br></p>
               </div>`
@@ -1168,7 +1127,7 @@ exports.Update = async (req, res) => {
                   <strong> ${updatedDocument.nurse}: The job ${updatedDocument.jobId} will be started in 2 hours. Pleaset prepare the job.</strong>
                   </p>
                   <p><strong>-----------------------<br></strong></p>
-                  <p><strong>Date</strong>: ${moment(Date.now()).format("MM/DD/YYYY")}</p>
+                  <p><strong>Date</strong>: ${moment.tz(new Date(), "America/Toronto").format("MM/DD/YYYY")}</p>
                   <p><strong><span class="il">BookSmart</span>™ <br></strong></p>
                   <p><br></p>
               </div>`

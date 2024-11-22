@@ -7,6 +7,35 @@ const Facility = db.facilities;
 const mailTrans = require("../controllers/mailTrans.controller.js");
 const expirationTime = 10000000;
 
+var dotenv = require('dotenv');
+dotenv.config()
+
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { v4: uuidv4 } = require('uuid');
+
+const s3 = new S3Client({
+    region: process.env.AWS_REGION,
+    credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+    }
+});
+
+async function uploadToS3(file) {
+    const { content, name, type } = file;
+  
+    const params = {
+        Bucket: process.env.AWS_BUCKET_NAME,
+        Key: `${uuidv4()}_${name}`,
+        Body: Buffer.from(content, 'base64'),
+        ContentType: type
+    };
+  
+    const command = new PutObjectCommand(params);
+    const upload = await s3.send(command);
+    return `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${params.Key}`;
+}
+
 exports.signup = async (req, res) => {
     try {
         console.log("register");
@@ -43,7 +72,7 @@ exports.login = async (req, res) => {
     try {
         console.log("LogIn");
         const { email, password, userRole } = req.body;
-        const isUser = await Admin.findOne({ email: email.toLowerCase(), password: password, userRole: userRole }, { email: 1, userRole: 1, firstName: 1, lastName: 1, userStatus: 1 });
+        const isUser = await Admin.findOne({ email: email.toLowerCase(), password: password, userRole: userRole }, { email: 1, userRole: 1, firstName: 1, lastName: 1, userStatus: 1, password: 1 });
         if (isUser) {
             if (isUser.userStatus === 'activate') {
                 const payload = {
@@ -134,15 +163,15 @@ exports.forgotPassword = async (req, res) => {
                 if (approveResult) {
                     const updateUser = await Admin.updateOne({ email: email }, { $set: { verifyCode: verifyCode, verifyTime: verifyTime } });
                     console.log(updateUser);
-                    res.status(200).json({ message: "Sucess" });
+                    return res.status(200).json({ message: "Sucess" });
                 }
             }
             else {
-                res.status(400).json({message: "Failde to generate VerifyCode. Please try again!"})
+                return res.status(400).json({message: "Failde to generate VerifyCode. Please try again!"})
             }
         }
         else {
-            res.status(404).json({ message: "User Not Found! Please Register First." })
+            return res.status(404).json({ message: "User Not Found! Please Register First." })
         }
     } catch (e) {
         console.log(e);
@@ -153,19 +182,21 @@ exports.forgotPassword = async (req, res) => {
 exports.verifyCode = async (req, res) => {
     try {
         console.log("verfyCode");
-        const { verifyCode } = req.body;
+        const { verifyCode, email } = req.body;
         console.log(verifyCode);
-        const isUser = await Admin.findOne({ verifyCode: verifyCode });
+        const isUser = await Admin.findOne({ email: email });
         if (isUser) {
             const verifyTime = Math.floor(Date.now() / 1000);
             if (verifyTime > isUser.verifyTime) {
-                res.status(401).json({message: "This verifyCode is expired. Please regenerate code!"})
+                return res.status(401).json({message: "This verifyCode is expired. Please regenerate code!"})
+            } else {
+                if (isUser.verifyCode == verifyCode) {
+                    return res.status(200).json({message: "Success to verify code."})
+                } else {
+                    return res.status(402).json({message: "Invalid verification code."})
+                }
             }
-            else {
-                res.status(200).json({message: "Success to verify code."})
-            }
-        }
-        else {
+        } else {
             res.status(404).json({ message: "User Not Found! Please Register First." })
         }
     } catch (e) {
@@ -269,15 +300,18 @@ exports.Update = async (req, res) => {
     const user = req.user;
 
     if (request?.photoImage?.name) {
-        const content = Buffer.from(request.photoImage.content, 'base64');
-        request.photoImage.content = content;
+        const s2FileUrl = await uploadToS3(request?.photoImage);
+        request.photoImage.content = s2FileUrl;
     }
+    console.log(request);
 
     if (user) {
-        Admin.findOneAndUpdate({ user } ,{ $set: request }, { new: false }, async (err, updatedDocument) => {
+        Admin.findOneAndUpdate({ email: user.email } ,{ $set: request }, { new: true }, async (err, updatedDocument) => {
+            console.log(err);
             if (err) {
                 return res.status(500).json({ error: err });
             } else {
+                console.log(updatedDocument);
                 const payload = {
                     email: user.email,
                     userRole: user.userRole,
@@ -286,6 +320,7 @@ exports.Update = async (req, res) => {
                 }
                 const token = setToken(payload);
                 const users = await Admin.findOne({email: request.email})
+                console.log(users);
                 if (users) {
                     return res.status(200).json({ message: 'Updated', token: token, user: users });
                 } else {
@@ -610,8 +645,7 @@ exports.updateUserInfo = async (req, res) => {
                 const verifiedContent8 = `
                 <div id=":15j" class="a3s aiL ">
                     <p>Hello ${adminUser.firstName},</p>
-                    <p>Your BookSmart™ account has been approved. To login please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw1QDW3VkX4lblO8gh8nfIYo">https://app.whybookdumb.com/<wbr>bs/#home-login</a></p>
-                    <p>To manage your account settings, please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login/knack-account" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login/knack-account&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw3TA8pRD_CD--MZ-ls68oIo">https://app.whybookdumb.com/<wbr>bs/#home-login/knack-account</a></p>
+                    <p>Your BookSmart™ account has been approved.</p>
                 </div>`
                 let approveResult8 = mailTrans.sendMail(adminUser.email, verifySubject8, verifiedContent8);
             } else {
@@ -649,8 +683,7 @@ exports.updateUserInfo = async (req, res) => {
                 const verifiedContent2 = `
                 <div id=":15j" class="a3s aiL ">
                     <p>Hello ${clientUser.firstName},</p>
-                    <p>Your BookSmart™ account has been approved. To login please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw1QDW3VkX4lblO8gh8nfIYo">https://app.whybookdumb.com/<wbr>bs/#home-login</a></p>
-                    <p>To manage your account settings, please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login/knack-account" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login/knack-account&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw3TA8pRD_CD--MZ-ls68oIo">https://app.whybookdumb.com/<wbr>bs/#home-login/knack-account</a></p>
+                    <p>Your BookSmart™ account has been approved.</p>
                 </div>`
                 let approveResult2 = mailTrans.sendMail(clientUser.email, verifySubject2, verifiedContent2);
             } else {
@@ -686,8 +719,7 @@ exports.updateUserInfo = async (req, res) => {
                 const verifiedContent5 = `
                 <div id=":15j" class="a3s aiL ">
                     <p>Hello ${facilityUser.firstName},</p>
-                    <p>Your BookSmart™ account has been approved. To login please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw1QDW3VkX4lblO8gh8nfIYo">https://app.whybookdumb.com/<wbr>bs/#home-login</a></p>
-                    <p>To manage your account settings, please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login/knack-account" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login/knack-account&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw3TA8pRD_CD--MZ-ls68oIo">https://app.whybookdumb.com/<wbr>bs/#home-login/knack-account</a></p>
+                    <p>Your BookSmart™ account has been approved.</p>
                 </div>`
                 let approveResult5 = mailTrans.sendMail(facilityUser.contactEmail, verifySubject5, verifiedContent5);
             } else {
@@ -743,8 +775,7 @@ exports.UpdateUser = async (req, res) => {
                         const verifiedContent = `
                         <div id=":15j" class="a3s aiL ">
                             <p>Hello ${updatedDocument.firstName},</p>
-                            <p>Your BookSmart™ account has been approved. To login please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw1QDW3VkX4lblO8gh8nfIYo">https://app.whybookdumb.com/<wbr>bs/#home-login</a></p>
-                            <p>To manage your account settings, please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login/knack-account" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login/knack-account&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw3TA8pRD_CD--MZ-ls68oIo">https://app.whybookdumb.com/<wbr>bs/#home-login/knack-account</a></p>
+                            <p>Your BookSmart™ account has been approved.</p>
                         </div>`
                         let approveResult = mailTrans.sendMail(updatedDocument.email, verifySubject, verifiedContent);
                     }
@@ -791,8 +822,7 @@ exports.UpdateUser = async (req, res) => {
                         const verifiedContent = `
                         <div id=":15j" class="a3s aiL ">
                             <p>Hello ${updatedDocument.firstName},</p>
-                            <p>Your BookSmart™ account has been approved. To login please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw1QDW3VkX4lblO8gh8nfIYo">https://app.whybookdumb.com/<wbr>bs/#home-login</a></p>
-                            <p>To manage your account settings, please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login/knack-account" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login/knack-account&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw3TA8pRD_CD--MZ-ls68oIo">https://app.whybookdumb.com/<wbr>bs/#home-login/knack-account</a></p>
+                            <p>Your BookSmart™ account has been approved.</p>
                         </div>`
                         let approveResult = mailTrans.sendMail(updatedDocument.contactEmail, verifySubject, verifiedContent);
                     }
@@ -839,8 +869,7 @@ exports.UpdateUser = async (req, res) => {
                         const verifiedContent = `
                         <div id=":15j" class="a3s aiL ">
                             <p>Hello ${updatedDocument.firstName},</p>
-                            <p>Your BookSmart™ account has been approved. To login please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw1QDW3VkX4lblO8gh8nfIYo">https://app.whybookdumb.com/<wbr>bs/#home-login</a></p>
-                            <p>To manage your account settings, please visit the following link:<br><a href="https://app.whybookdumb.com/bs/#home-login/knack-account" target="_blank" data-saferedirecturl="https://www.google.com/url?q=https://app.whybookdumb.com/bs/%23home-login/knack-account&amp;source=gmail&amp;ust=1721895769161000&amp;usg=AOvVaw3TA8pRD_CD--MZ-ls68oIo">https://app.whybookdumb.com/<wbr>bs/#home-login/knack-account</a></p>
+                            <p>Your BookSmart™ account has been approved.</p>
                         </div>`
                         let approveResult = mailTrans.sendMail(updatedDocument.email, verifySubject, verifiedContent);
                     }
@@ -997,8 +1026,6 @@ exports.UpdateUser = async (req, res) => {
 
 exports.getBidIDs = async (req, res) => {
     try {
-        const user = req.user;
-        
         // Find clinical and facility data
         const bidders = await Bid.find({}, { bidId: 1 });
     
@@ -1007,15 +1034,7 @@ exports.getBidIDs = async (req, res) => {
             ...bidders.map(item => item.bidId),
         ];
 
-        const payload = {
-            email: user.email,
-            userRole: user.userRole,
-            iat: Math.floor(Date.now() / 1000),
-            exp: Math.floor(Date.now() / 1000) + expirationTime
-        }
-        const token = setToken(payload);
-    
-        return res.status(200).json({ message: "success", bidList, token });
+        return res.status(200).json({ message: "success", bidList });
     } catch (e) {
         console.log(e);
         return res.status(500).json({ message: "An Error Occurred!" });
@@ -1024,8 +1043,6 @@ exports.getBidIDs = async (req, res) => {
 
 exports.getAllUsersName = async (req, res) => {
     try {
-        const user = req.user;
-        
         // Find clinical and facility data
         const clinicals = await Clinical.find({}, { firstName: 1, lastName: 1 });
         const facilities = await Facility.find({}, { firstName: 1, lastName: 1 });
@@ -1038,16 +1055,7 @@ exports.getAllUsersName = async (req, res) => {
     
         // Sort the combined names alphabetically
         combinedNames.sort((a, b) => a.localeCompare(b));
-
-        const payload = {
-            email: user.email,
-            userRole: user.userRole,
-            iat: Math.floor(Date.now() / 1000), // Issued at time
-            exp: Math.floor(Date.now() / 1000) + expirationTime // Expiration time
-        }
-        const token = setToken(payload);
-    
-        return res.status(200).json({ message: "success", userList: combinedNames, token });
+        return res.status(200).json({ message: "success", userList: combinedNames });
     } catch (e) {
         console.log(e);
         return res.status(500).json({ message: "An Error Occurred!" });
